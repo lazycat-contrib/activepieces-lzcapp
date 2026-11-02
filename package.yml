@@ -1,6 +1,6 @@
 package: community.lazycat.app.activepieces
 name: Activepieces
-version: 0.0.0
+version: 0.92.3
 description: "Open-source automation: connect apps with flows, a self-hosted Zapier alternative."
 min_os_version: "1.5.0"
 homepage: https://www.activepieces.com/
