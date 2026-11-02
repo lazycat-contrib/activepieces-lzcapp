@@ -1,0 +1,142 @@
+name: Verify Activepieces Release on GitHub
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: false
+        default: v0.92.3
+permissions:
+  contents: read
+concurrency:
+  group: activepieces-release-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="$(gh release view --json tagName --jq .tagName)"; fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download exact Release asset on runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ASSET_NAME="community.lazycat.app.activepieces-${RELEASE_TAG}.lpk"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+          gh release view "$RELEASE_TAG" --json tagName,assets > release-metadata.json
+          gh release download "$RELEASE_TAG" --pattern "$ASSET_NAME" --dir verify-pkg
+
+      - name: Verify package contents
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, tarfile, yaml
+
+          tag = os.environ['RELEASE_TAG']
+          name = os.environ['ASSET_NAME']
+          pkg = __import__('pathlib').Path('verify-pkg') / name
+          assert pkg.is_file(), pkg
+
+          h = hashlib.sha256()
+          with pkg.open('rb') as fh:
+              for chunk in iter(lambda: fh.read(1 << 20), b''):
+                  h.update(chunk)
+
+          with tarfile.open(pkg, 'r:') as package:
+              members = package.getnames()
+              for required in ('manifest.yml', 'package.yml', 'content.tar', 'icon.png'):
+                  assert required in members, (required, members)
+
+              info = yaml.safe_load(package.extractfile('package.yml').read())
+              assert info['package'] == 'community.lazycat.app.activepieces', info['package']
+              assert info['name'] == 'Activepieces', info['name']
+              assert info['version'] == tag.lstrip('v'), (info['version'], tag)
+              assert info['license'] == 'MIT', info['license']
+              assert info['min_os_version'] == '1.5.0', info['min_os_version']
+
+              raw = package.extractfile('manifest.yml').read().decode()
+              m = yaml.safe_load(raw)
+              app = m['application']
+              assert app['subdomain'] == 'activepieces', app['subdomain']
+              ups = app['upstreams']
+              assert any(u['location'] == '/' and u['backend'] == 'http://activepieces:80/' for u in ups), ups
+              # databases must not be reachable through the ingress
+              for u in ups:
+                  b = u.get('backend') or ''
+                  assert 'db:' not in b and 'redis:' not in b, b
+
+              svcs = m['services']
+              assert set(svcs) == {'activepieces', 'db', 'redis'}, set(svcs)
+
+              ap = svcs['activepieces']
+              assert 'activepieces/activepieces' in ap['image'], ap['image']
+              assert ap['image'].endswith(':' + tag.lstrip('v')), ap['image']
+
+              env = ' '.join(str(x) for x in ap['environment'])
+              # encryption key protects stored credentials
+              assert 'AP_ENCRYPTION_KEY=' in env and 'stable_secret' in env, env
+              assert 'AP_JWT_SECRET=' in env, env
+              # webhooks and links are absolute; must be the public https origin
+              assert 'AP_FRONTEND_URL=https://' in env, env
+              assert 'AP_POSTGRES_HOST=db' in env, env
+              assert 'AP_REDIS_HOST=redis' in env, env
+              # sandboxed execution needs privileges the runtime does not grant
+              assert 'AP_EXECUTION_MODE=UNSANDBOXED' in env, env
+              assert 'AP_TELEMETRY_ENABLED=false' in env, env
+
+              assert any(b.endswith(':/root/.activepieces') for b in ap['binds']), ap['binds']
+
+              db = svcs['db']
+              assert 'postgres:16' in db['image'], db['image']
+              assert 'healthcheck' in db
+              assert any(b.endswith(':/var/lib/postgresql/data') for b in db['binds']), db['binds']
+
+              rd = svcs['redis']
+              assert 'redis:7' in rd['image'], rd['image']
+              assert 'healthcheck' in rd
+              assert any(b.endswith(':/data') for b in rd['binds']), rd['binds']
+              # internal cache only
+              assert not rd.get('ports'), rd.get('ports')
+
+              # account comes from public self-signup: no seeded admin
+              assert 'deploy_params.yml' not in members, members
+
+              for key, svc in svcs.items():
+                  assert 'healthcheck' not in svc or key in ('db', 'redis'), (key, svc.get('healthcheck'))
+
+              # every .U.<id> referenced must be declared somewhere or absent
+              refs = set(re.findall(r'\.U\.([A-Za-z0-9_]+)', raw))
+              assert not refs, f'unexpected deploy-param refs: {refs}'
+
+              assert 'lzc-file-chooser' not in raw
+              assert 'usage' in m and str(m['usage']).strip(), 'usage section missing'
+              usage_text = str(m['usage'])
+              assert ('真机验证' in usage_text or '实机验证' in usage_text), 'usage must state no device test'
+
+              with tarfile.open(fileobj=package.extractfile('content.tar')) as content:
+                  cmembers = content.getnames()
+                  lic = [n for n in cmembers if 'licenses/' in n]
+                  assert lic, cmembers
+                  main_lic = [n for n in lic if n.endswith('/LICENSE')]
+                  target = main_lic[0] if main_lic else lic[0]
+                  license_text = content.extractfile(target).read().decode()
+              assert 'Permission is hereby granted' in license_text, license_text[:150]
+
+          result = {
+              'verified': True,
+              'tag': tag,
+              'sha256': h.hexdigest(),
+              'size': pkg.stat().st_size,
+              'runtime_tested': False,
+          }
+          print(json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
