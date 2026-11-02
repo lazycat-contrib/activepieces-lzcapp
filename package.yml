@@ -1,0 +1,18 @@
+package: community.lazycat.app.activepieces
+name: Activepieces
+version: 0.0.0
+description: "Open-source automation: connect apps with flows, a self-hosted Zapier alternative."
+min_os_version: "1.5.0"
+homepage: https://www.activepieces.com/
+author: Activepieces
+license: MIT
+permissions:
+  required:
+    - net.internet
+locales:
+  zh:
+    name: Activepieces
+    description: "开源自动化平台：把各种应用连成流程，收到事件就自动做事，可自托管的 Zapier 替代品。"
+  en:
+    name: Activepieces
+    description: "Open-source automation: connect apps with flows, a self-hosted Zapier alternative."
